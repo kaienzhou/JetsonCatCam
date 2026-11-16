@@ -1,0 +1,14 @@
+{
+  "port": 8080,
+  "log": "data/events.jsonl",
+  "debug": false,
+  "max_fps": 0,
+  "camera": {"source": "/dev/video0", "min_conf": 0.4, "width": 640, "height": 480},
+  "_camera_note": "USB camera: /dev/video0 (width/height = capture size). Pi Camera V2/NoIR on CSI: csi://0 (width/height = size of the frames used for detection and the web page; sensor_mode 3 = 1640x1232 @ 30 fps). Add \"rotate\": 180 (or 90/270) to the camera block if the picture is upside down.",
+  "tracker": {"enter_frames": 5, "leave_seconds": 3.0, "lost_seconds": 5.0},
+  "notify": {"url": "", "zones": ["食盆"]},
+  "zones": [
+    {"name": "沙发", "points": [[0.05, 0.10], [0.45, 0.10], [0.45, 0.45], [0.05, 0.45]]},
+    {"name": "食盆", "points": [[0.60, 0.60], [0.95, 0.60], [0.95, 0.95], [0.60, 0.95]]}
+  ]
+}

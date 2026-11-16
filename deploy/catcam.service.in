@@ -1,0 +1,23 @@
+[Unit]
+Description=JetsonCatCam - cat zone tracker
+After=network-online.target nvargus-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+WorkingDirectory=@DIR@
+# Start from a clean camera daemon every time: after a crash it can be wedged
+# ("Failed to create CaptureSession"). "-" ignores a failure, "+" runs it as root.
+ExecStartPre=-+/bin/systemctl restart nvargus-daemon
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/bin/python3 -u -m catcam --backend jetson --config @DIR@/config.json
+# The app exits on purpose when the camera stops delivering frames; just start it again.
+Restart=always
+RestartSec=3
+# SIGTERM lets the app close the camera cleanly.
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
