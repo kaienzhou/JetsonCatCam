@@ -1,6 +1,8 @@
 {
   "port": 8080,
-  "log": "data/events.jsonl",
+  "data_dir": "data",
+  "auth": {"enabled": true, "code": ""},
+  "snapshots": {"enabled": true, "keep_days": 30, "max_mb": 500},
   "debug": false,
   "max_fps": 0,
   "camera": {"source": "/dev/video0", "min_conf": 0.4, "width": 640, "height": 480},

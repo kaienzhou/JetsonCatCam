@@ -41,7 +41,12 @@ def _jetson_modules(need_inference=True):
 
 
 class FakeBackend(object):
-    """Cat walks a loop of waypoints; for testing logic and UI without hardware."""
+    """Cat walks a loop of waypoints; for testing logic and UI without hardware.
+
+    With OpenCV the picture is a small room (sofa, food bowl, a cat) so the web page has
+    something to show. speed is in picture widths per second; try 0.3 to see events quickly
+    ("fake": {"speed": 0.3} in config.json).
+    """
 
     PATH = [(0.15, 0.2), (0.15, 0.8), (0.8, 0.8), (0.8, 0.2), (0.5, 0.5)]
 
@@ -50,6 +55,37 @@ class FakeBackend(object):
         self.speed = speed
         self.t0 = time.time()
         self.cv2 = _cv2()
+        self._room = None
+
+    def _scene(self, cx, cy):
+        import numpy as np
+        cv2 = self.cv2
+        w, h = self.size
+        if self._room is None:
+            room = np.empty((h, w, 3), np.uint8)
+            room[:] = (112, 100, 92)                      # wall
+            room[int(h * 0.50):] = (96, 128, 164)         # floor
+            cv2.rectangle(room, (int(w * 0.05), int(h * 0.12)), (int(w * 0.45), int(h * 0.46)),
+                          (84, 70, 140), -1)              # sofa
+            cv2.rectangle(room, (int(w * 0.05), int(h * 0.30)), (int(w * 0.45), int(h * 0.46)),
+                          (96, 84, 160), -1)              # cushion
+            cv2.ellipse(room, (int(w * 0.78), int(h * 0.80)), (int(w * 0.09), int(h * 0.05)),
+                        0, 0, 360, (60, 60, 190), -1)     # food bowl
+            cv2.ellipse(room, (int(w * 0.78), int(h * 0.79)), (int(w * 0.06), int(h * 0.03)),
+                        0, 0, 360, (90, 150, 210), -1)
+            self._room = room
+        frame = self._room.copy()
+        x, y = int(cx * w), int(cy * h)
+        fur = (40, 150, 240)
+        cv2.ellipse(frame, (x, y), (int(w * 0.05), int(h * 0.04)), 0, 0, 360, fur, -1)           # body
+        cv2.circle(frame, (x + int(w * 0.045), y - int(h * 0.025)), int(w * 0.027), fur, -1)     # head
+        top = y - int(h * 0.045)
+        for dx in (0.035, 0.057):                                                                  # ears
+            ex = x + int(w * dx)
+            cv2.fillPoly(frame, [np.array([(ex - 5, top), (ex + 5, top), (ex, y - int(h * 0.075))],
+                                          np.int32)], fur)
+        cv2.line(frame, (x - int(w * 0.05), y), (x - int(w * 0.085), y - int(h * 0.03)), fur, 4)  # tail
+        return frame
 
     def _pos(self):
         d = (time.time() - self.t0) * self.speed
@@ -69,11 +105,7 @@ class FakeBackend(object):
         time.sleep(0.1)
         cx, cy = self._pos()
         box = (cx - 0.06, cy - 0.06, cx + 0.06, cy + 0.06)
-        frame = None
-        if self.cv2:
-            import numpy as np
-            w, h = self.size
-            frame = np.full((h, w, 3), 40, np.uint8)
+        frame = self._scene(cx, cy) if self.cv2 else None
         return frame, (cx, cy), box
 
 
