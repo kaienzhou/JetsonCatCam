@@ -8,13 +8,14 @@ from . import __version__, notify, web
 from .auth import Auth
 from .backends import FakeBackend, JetsonBackend
 from .config import Config
+from .samples import Samples
 from .store import SNAP_TYPES, Store
 from .zones import Zone, ZoneTracker
 
 LABEL = {"appear": "出现", "lost": "离开视野", "enter": "进入", "leave": "离开"}
 
 
-def draw(cv2, frame, zones, box, current, detections=None):
+def draw(cv2, frame, zones, box, current, detections=None, weak=None, window=None):
     import numpy as np
     h, w = frame.shape[:2]
     for z in zones:
@@ -22,6 +23,14 @@ def draw(cv2, frame, zones, box, current, detections=None):
         color = (0, 220, 0) if z.name == current else (200, 200, 200)
         cv2.polylines(frame, [np.array(pts, "int32")], True, color, 2)
         cv2.putText(frame, z.name, pts[0], cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    if window:  # the part of the picture the detector looks at (cats outside it are not found)
+        cv2.rectangle(frame, (int(window[0] * w), int(window[1] * h)),
+                      (int(window[2] * w) - 1, int(window[3] * h) - 1), (255, 255, 255), 1)
+    for name, conf, (l, t, r, b) in weak or []:  # debug: cats the network was not sure enough about
+        p1 = (int(l * w), int(t * h))
+        cv2.rectangle(frame, p1, (int(r * w), int(b * h)), (150, 150, 150), 1)
+        cv2.putText(frame, "%s %.2f?" % (name, conf), (p1[0], max(12, p1[1] - 4)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (190, 190, 190), 1)
     for name, conf, (l, t, r, b) in detections or []:  # debug: everything the network found
         p1 = (int(l * w), int(t * h))
         cv2.rectangle(frame, p1, (int(r * w), int(b * h)), (0, 255, 255), 1)
@@ -97,13 +106,51 @@ def _record(store, cache, events, jpeg, notify_url, notify_zones):
         cache.dirty = True
 
 
+def _tell_zones(backend, zones):
+    """Backends that can look at just the zones (JetsonBackend) want to know where they are."""
+    set_zones = getattr(backend, "set_zones", None)
+    if set_zones is not None:
+        set_zones(zones)
+
+
+def _keep_sample(samples, backend, tracker, frame):
+    """Save the camera picture as the detector got it, and what the detector made of it.
+
+    Returns the sample's name, or "" if it could not be saved.
+    """
+    if frame is None:
+        return ""
+    try:
+        import cv2
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        if not ok:
+            return ""
+
+        def boxes(items):
+            return [[n, round(c, 3), [round(v, 4) for v in b]] for n, c, b in items or []]
+        info = {"frame": [frame.shape[1], frame.shape[0]], "present": tracker.present,
+                "zone": tracker.current, "zones": [z.to_json() for z in tracker.zones],
+                "detections": boxes(getattr(backend, "last_detections", None)),
+                "weak": boxes(getattr(backend, "weak", None)),
+                "window": getattr(backend, "window", None)}
+        describe = getattr(backend, "describe", None)
+        if describe is not None:
+            info["detector"] = describe()
+        return samples.save(buf.tobytes(), info)
+    except Exception as exc:  # a full disk must not stop the camera
+        print("could not save a sample:", exc, flush=True)
+        return ""
+
+
 def run(backend, tracker, store, shared, notify_url, notify_zones, debug=False, max_fps=0,
-        stop=lambda: False, keep_days=30, max_snap_bytes=500 * 1024 * 1024):
+        stop=lambda: False, keep_days=30, max_snap_bytes=500 * 1024 * 1024, display_width=0,
+        samples=None):
     """Main loop. max_fps > 0 limits the loop rate (less heat and power draw);
     stop() is polled once per iteration (tests use it to end the loop).
 
     Pictures are only drawn and encoded while somebody watches (or when an event needs a
-    snapshot): an unattended camera costs less power.
+    snapshot): an unattended camera costs less power. They are shrunk to display_width
+    first (0: as they are), the detector may work on bigger frames.
     """
     try:
         import cv2
@@ -113,15 +160,20 @@ def run(backend, tracker, store, shared, notify_url, notify_zones, debug=False, 
     status = "ok"
     last_frame = time.time()
     fps = 0.0
-    min_dt = 1.0 / max_fps if max_fps else 0.0
+    avg_dt = 0.0  # moving average of the time between pictures (average the times, not the rates:
+    min_dt = 1.0 / max_fps if max_fps else 0.0  # a picture that was already waiting would count as 1000 fps)
     cache = StateCache(store)
     next_purge = 0.0
+    if debug:
+        shared.debug = True  # the web page can switch it off and on again
+    _tell_zones(backend, tracker.zones)
     while not stop():
         t_iter = time.time()
 
         request = shared.take_zone_request()  # the zone editor saved something
         if request is not None:
             _record(store, cache, tracker.set_zones(t_iter, request), None, notify_url, notify_zones)
+            _tell_zones(backend, tracker.zones)
         if time.monotonic() >= next_purge:
             next_purge = time.monotonic() + 3600
             try:
@@ -136,28 +188,41 @@ def run(backend, tracker, store, shared, notify_url, notify_zones, debug=False, 
         if result is None:  # no frame: camera timeout or reconnecting
             if status == "ok" and now - last_frame > 5:
                 status = "no_camera"
-                fps = 0.0
+                fps = avg_dt = 0.0
                 shared.set_state(make_state(tracker, cache, status, now))
             continue
         dt = now - last_frame
         if 0 < dt < 2:  # ignore gaps (startup, camera glitches)
-            fps = 1.0 / dt if not fps else 0.9 * fps + 0.1 / dt
+            avg_dt = dt if not avg_dt else 0.9 * avg_dt + 0.1 * dt
+            fps = 1.0 / avg_dt
         last_frame = now
         status = "ok"
         frame, point, box = result
 
-        events = tracker.update(now, point)
+        if samples is not None and shared.take_sample_request():  # before anything is drawn on the frame
+            shared.set_sample_result(_keep_sample(samples, backend, tracker, frame))
+
+        # between two detections (see detector.max_fps) the picture is new but the result is the
+        # old one: counting it again would make one sighting look like several frames in a row
+        events = tracker.update(now, point) if getattr(backend, "fresh", True) else []
 
         jpeg = None
         watching = shared.wants_frame()
         need_snapshot = any(e["type"] in SNAP_TYPES for e in events)
         if cv2 is not None and frame is not None and (watching or need_snapshot or shared.wants_raw()):
+            if display_width and frame.shape[1] > display_width:
+                frame = cv2.resize(frame, (display_width, int(round(frame.shape[0] * display_width
+                                                                    / float(frame.shape[1])))),
+                                   interpolation=cv2.INTER_AREA)
+            window = getattr(backend, "window", None)  # what the detector looks at, None: all of it
             if shared.wants_raw():  # the zone editor wants the picture without our drawings
                 ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
                 if ok:
-                    shared.set_raw(buf.tobytes())
-            dets = getattr(backend, "last_detections", None) if debug else None
-            draw(cv2, frame, tracker.zones, box, tracker.current, dets)
+                    shared.set_raw(buf.tobytes(), window)
+            show = shared.debug
+            dets = getattr(backend, "last_detections", None) if show else None
+            weak = getattr(backend, "weak", None) if show else None
+            draw(cv2, frame, tracker.zones, box, tracker.current, dets, weak, window)
             ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
             if ok:
                 jpeg = buf.tobytes()
@@ -244,7 +309,10 @@ def main():
     shared = web.Shared()
     shared.zones_json = [z.to_json() for z in zones]
     shared.set_state(make_state(tracker, StateCache(store), "starting", time.time()))
-    web.serve(web.Context(shared, auth, store, config), port)
+    samples_cfg = cfg.get("samples", {})
+    samples = (Samples(os.path.join(data_dir, "samples"), keep=int(samples_cfg.get("keep", 300)))
+               if samples_cfg.get("enabled", True) else None)
+    web.serve(web.Context(shared, auth, store, config, samples=samples), port)
     print("catcam %s: web ui on port %d" % (__version__, port), flush=True)
     if auth.created:
         print("=" * 60)
@@ -252,16 +320,23 @@ def main():
         print("随时查看：python3 -m catcam code   （在项目目录里执行）")
         print("=" * 60, flush=True)
 
+    debug = cfg.get("debug", False)
+    camera_cfg = dict(cfg.get("camera", {}))
     if args.backend == "fake":
         backend = FakeBackend(**cfg.get("fake", {}))
     else:
-        backend = JetsonBackend(detector=cfg.get("detector"), **cfg.get("camera", {}))
+        detector_cfg = dict(cfg.get("detector") or {})
+        # the debug overlay (which can be switched on in the web page at any time) also shows
+        # cats the network was unsure about
+        detector_cfg.setdefault("weak_conf", 0.1)
+        backend = JetsonBackend(detector=detector_cfg, **camera_cfg)
 
     try:
         run(backend, tracker, store, shared, notify_url, notify_zones,
-            debug=cfg.get("debug", False), max_fps=cfg.get("max_fps", 0),
+            debug=debug, max_fps=cfg.get("max_fps", 0),
             keep_days=snap_cfg.get("keep_days", 30),
-            max_snap_bytes=int(snap_cfg.get("max_mb", 500)) * 1024 * 1024)
+            max_snap_bytes=int(snap_cfg.get("max_mb", 500)) * 1024 * 1024,
+            display_width=camera_cfg.get("display_width", 640), samples=samples)
     finally:
         backend.close()
         store.close()

@@ -125,6 +125,39 @@ def parse_zones(raw):
     return zones
 
 
+def watch_window(zones, aspect=1.0, margin=0.05, min_size=0.3, max_area=0.72):
+    """The part of the picture the detector has to look at, so that it can look at it bigger.
+
+    Returns (left, top, right, bottom) normalized, or None when the zones need (nearly) the
+    whole picture. The window is the bounding box of all zones plus `margin`, at least
+    `min_size` of the picture wide (zooming in further than that only shows less), grown to
+    `aspect` and moved inside the picture. aspect is width / height of the window in
+    normalized units: the network input's aspect divided by the picture's (1.0 when both
+    are 4:3). A window covering more than `max_area` of the picture is not worth it.
+    """
+    pts = [p for z in zones for p in z.points]
+    if not pts or aspect <= 0:
+        return None
+    x0, x1 = min(p[0] for p in pts), max(p[0] for p in pts)
+    y0, y1 = min(p[1] for p in pts), max(p[1] for p in pts)
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    w = max(x1 - x0 + 2 * margin, min_size)
+    h = max(y1 - y0 + 2 * margin, min_size / aspect)
+    if w / h < aspect:
+        w = h * aspect
+    else:
+        h = w / aspect
+    if w > 1.0:
+        w, h = 1.0, 1.0 / aspect
+    if h > 1.0:
+        w, h = aspect, 1.0
+    if w * h > max_area:
+        return None
+    left = min(max(cx - w / 2.0, 0.0), 1.0 - w)
+    top = min(max(cy - h / 2.0, 0.0), 1.0 - h)
+    return (left, top, left + w, top + h)
+
+
 class ZoneTracker(object):
     """Turns a noisy per-frame cat position into stable events.
 

@@ -46,6 +46,7 @@ CSP = ("default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe
 
 MAX_VIEWERS = 6        # simultaneous video streams
 SNAP_URL = re.compile(r"^/snap/(\d{1,12})\.jpg$")
+SAMPLE_URL = re.compile(r"^/sample/([0-9-]{15,19}\.(?:jpg|json))$")
 
 
 class Shared(object):
@@ -58,13 +59,17 @@ class Shared(object):
         self.image_time = 0.0
         self.raw = None            # latest JPEG without drawings, for the zone editor
         self.raw_time = 0.0
+        self.raw_watch = None      # the part of that picture the detector looks at, or None
         self.state = {"status": "starting", "present": False, "zone": None, "since": None,
                       "totals": {}, "visits": {}, "events": [], "zones": []}
         self.viewers = 0
         self.last_view = -1e9      # monotonic time of the last picture request (never, so far)
+        self.debug = False         # draw what the detector sees on the pictures
         self.raw_until = 0.0
         self.zones_json = []       # the zones in force, as the editor shows them
         self._zone_request = None
+        self._sample_request = False
+        self._sample_result = None
 
     # -- written by the main loop
 
@@ -75,9 +80,10 @@ class Shared(object):
             self.seq += 1
             self.cond.notify_all()
 
-    def set_raw(self, jpeg):
+    def set_raw(self, jpeg, watch=None):
         with self.cond:
             self.raw = jpeg
+            self.raw_watch = watch
             self.raw_time = time.monotonic()
             self.cond.notify_all()
 
@@ -96,6 +102,17 @@ class Shared(object):
         with self.cond:
             req, self._zone_request = self._zone_request, None
             return req
+
+    def take_sample_request(self):
+        """Did somebody ask to keep the next picture? (asking again is answered with the same one)"""
+        with self.cond:
+            req, self._sample_request = self._sample_request, False
+            return req
+
+    def set_sample_result(self, name):
+        with self.cond:
+            self._sample_result = name or ""
+            self.cond.notify_all()
 
     # -- used by the HTTP threads
 
@@ -117,6 +134,20 @@ class Shared(object):
     def request_zones(self, zones):
         with self.cond:
             self._zone_request = zones
+
+    def request_sample(self, timeout):
+        """Ask the main loop to keep the next camera picture. Returns its name, None if that failed."""
+        end = time.monotonic() + timeout
+        with self.cond:
+            self._sample_result = None
+            self._sample_request = True
+            while self._sample_result is None:
+                left = end - time.monotonic()
+                if left <= 0:
+                    self._sample_request = False
+                    return None
+                self.cond.wait(left)
+            return self._sample_result or None
 
     def wait_frame(self, last_seq, timeout):
         """Block until a picture newer than last_seq exists. Returns (seq, jpeg) or (last_seq, None)."""
@@ -155,11 +186,12 @@ class Shared(object):
 class Context(object):
     """Everything the request handlers need."""
 
-    def __init__(self, shared, auth, store, config, name=None):
+    def __init__(self, shared, auth, store, config, name=None, samples=None):
         self.shared = shared
         self.auth = auth
         self.store = store
         self.config = config
+        self.samples = samples
         self.name = name or socket.gethostname()
         self.started = time.time()
 
@@ -292,6 +324,7 @@ def _make_handler(ctx):
                 "/api/zones": lambda: self._json(200, {"zones": shared.zones_json}),
                 "/api/frame.jpg": lambda: self._frame(query),
                 "/api/export.csv": lambda: self._export(query),
+                "/api/samples": self._samples,
                 "/stream.mjpg": self._stream,
             }
             handler = routes.get(path)
@@ -300,6 +333,9 @@ def _make_handler(ctx):
             m = SNAP_URL.match(path)
             if m:
                 return self._snapshot(int(m.group(1)))
+            m = SAMPLE_URL.match(path)
+            if m:
+                return self._sample_file(m.group(1))
             self._json(404, {"error": "not found"})
 
         def _page(self, path):
@@ -320,7 +356,25 @@ def _make_handler(ctx):
         def _info(self):
             self._json(200, {"name": ctx.name, "version": __version__, "login": auth.enabled,
                              "uptime": round(time.time() - ctx.started), "now": time.time(),
-                             "storage": store.stats()})
+                             "storage": store.stats(), "debug": shared.debug,
+                             "samples": ctx.samples.count() if ctx.samples else None})
+
+        def _samples(self):
+            if not ctx.samples:
+                return self._json(404, {"error": "samples are switched off"})
+            self._json(200, {"count": ctx.samples.count(), "latest": ctx.samples.latest(20)})
+
+        def _sample_file(self, filename):
+            path = ctx.samples.path(filename) if ctx.samples else None
+            if not path:
+                return self._json(404, {"error": "no such sample"})
+            try:
+                with open(path, "rb") as f:
+                    body = f.read()
+            except OSError:
+                return self._json(404, {"error": "no such sample"})
+            ctype = "image/jpeg" if filename.endswith(".jpg") else "application/json; charset=utf-8"
+            self._send(200, ctype, body, cache="private, max-age=86400")
 
         def _history(self, query):
             days = _int(query, "days", 14, 1, 90)
@@ -349,13 +403,17 @@ def _make_handler(ctx):
             self._send(200, "image/jpeg", body, cache="private, max-age=86400")
 
         def _frame(self, query):
+            extra = []
             if query.get("raw", ["0"])[0] == "1":
                 jpeg = shared.get_raw(max_age=3.0, timeout=2.5)
+                watch = shared.raw_watch
+                if jpeg is not None and watch:  # the editor shows what the detector looks at
+                    extra.append(("X-Watch", ",".join("%.4f" % v for v in watch)))
             else:
                 jpeg = shared.get_image(max_age=3.0, timeout=2.5)
             if jpeg is None:
                 return self._json(503, {"error": "no picture from the camera yet"})
-            self._send(200, "image/jpeg", jpeg)
+            self._send(200, "image/jpeg", jpeg, extra)
 
         def _export(self, query):
             days = _int(query, "days", 365, 1, 3650)
@@ -401,7 +459,7 @@ def _make_handler(ctx):
 
         def do_POST(self):
             path = urlparse(self.path).path
-            if path not in ("/api/login", "/api/logout", "/api/zones"):
+            if path not in ("/api/login", "/api/logout", "/api/zones", "/api/debug", "/api/sample"):
                 return self._json(404, {"error": "not found"})
             if not self._same_origin():
                 return self._json(403, {"error": "wrong origin"})
@@ -414,7 +472,20 @@ def _make_handler(ctx):
                 return self._login(body)
             if not self._authed():
                 return self._json(401, {"error": "login required"})
+            if path == "/api/debug":
+                shared.debug = bool(body.get("on"))
+                return self._json(200, {"ok": True, "debug": shared.debug})
+            if path == "/api/sample":
+                return self._keep_sample()
             self._save_zones(body)
+
+        def _keep_sample(self):
+            if not ctx.samples:
+                return self._json(404, {"error": "samples are switched off"})
+            name = shared.request_sample(timeout=4.0)
+            if not name:
+                return self._json(503, {"error": "没有摄像头画面，没能保存"})
+            self._json(200, {"ok": True, "name": name, "count": ctx.samples.count()})
 
         def _cookie_header(self, value, max_age):
             return "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Lax" % (auth.COOKIE, value, max_age)

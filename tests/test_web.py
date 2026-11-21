@@ -177,6 +177,19 @@ class DataTest(WebTestCase):
         info = self.get_json("/api/info")
         self.assertEqual((info["name"], info["login"]), ("testcam", True))
         self.assertEqual(info["storage"]["events"], 0)
+        self.assertIs(info["debug"], False)
+
+    def test_the_detection_overlay_can_be_switched_on_and_off(self):
+        status, _, body = self.req("POST", "/api/debug", {"on": True}, cookie=self.cookie)
+        self.assertEqual((status, json.loads(body.decode("utf-8"))["debug"]), (200, True))
+        self.assertTrue(self.shared.debug)
+        self.assertIs(self.get_json("/api/info")["debug"], True)
+        self.req("POST", "/api/debug", {"on": False}, cookie=self.cookie)
+        self.assertFalse(self.shared.debug)
+
+    def test_the_overlay_switch_needs_a_login(self):
+        self.assertEqual(self.req("POST", "/api/debug", {"on": True})[0], 401)
+        self.assertFalse(self.shared.debug)
 
     def test_history_counts_the_stay_in_progress(self):
         self.shared.set_state({"zone": "沙发", "since": time.time() - 30, "zones": ["沙发"]})
@@ -269,6 +282,14 @@ class PictureTest(WebTestCase):
         status, _, body = self.req("GET", "/api/frame.jpg?raw=1", cookie=self.cookie)
         self.assertEqual((status, body), (200, b"\xff\xd8plain"))
         self.assertTrue(self.shared.wants_raw())
+
+    def test_the_editor_picture_says_what_the_detector_looks_at(self):
+        self.shared.set_raw(b"\xff\xd8raw", (0.25, 0.125, 0.75, 0.625))
+        status, headers, _ = self.req("GET", "/api/frame.jpg?raw=1", cookie=self.cookie)
+        self.assertEqual((status, headers["x-watch"]), (200, "0.2500,0.1250,0.7500,0.6250"))
+        self.shared.set_raw(b"\xff\xd8raw")  # the whole picture
+        status, headers, _ = self.req("GET", "/api/frame.jpg?raw=1", cookie=self.cookie)
+        self.assertNotIn("x-watch", headers)
 
     def test_no_picture_yet(self):
         started = time.time()

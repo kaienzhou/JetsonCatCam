@@ -3,7 +3,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from catcam.zones import Zone, ZoneTracker, parse_zones, point_in_polygon
+from catcam.zones import Zone, ZoneTracker, parse_zones, point_in_polygon, watch_window
 
 SQUARE = [(0, 0), (1, 0), (1, 1), (0, 1)]
 
@@ -76,6 +76,52 @@ class TrackerTest(unittest.TestCase):
         t.update(0, (0.5, 0.5))
         t.update(10, None)
         self.assertEqual(types(t.update(20, (0.5, 0.5))), [("appear", None)])
+
+
+def box(x0, y0, x1, y1, name="z"):
+    return Zone(name, [(x0, y0), (x1, y0), (x1, y1), (x0, y1)])
+
+
+class WatchWindowTest(unittest.TestCase):
+    def test_a_compact_zone_gets_a_window_around_it(self):
+        l, t, r, b = watch_window([box(0.5, 0.5, 0.7, 0.7)], margin=0.05)
+        # 0.2 + 2 * 0.05 = 0.3 wide and high, centred on the zone
+        for got, want in zip((l, t, r, b), (0.45, 0.45, 0.75, 0.75)):
+            self.assertAlmostEqual(got, want)
+
+    def test_the_window_covers_all_zones(self):
+        l, t, r, b = watch_window([box(0.1, 0.1, 0.2, 0.2, "a"), box(0.5, 0.4, 0.6, 0.5, "b")], margin=0.0)
+        self.assertLessEqual(l, 0.1)
+        self.assertLessEqual(t, 0.1)
+        self.assertGreaterEqual(r, 0.6)
+        self.assertGreaterEqual(b, 0.5)
+
+    def test_a_tiny_zone_is_not_zoomed_in_beyond_min_size(self):
+        l, t, r, b = watch_window([box(0.5, 0.5, 0.52, 0.52)], margin=0.0, min_size=0.3)
+        self.assertAlmostEqual(r - l, 0.3)
+        self.assertAlmostEqual(b - t, 0.3)
+
+    def test_the_window_keeps_the_aspect_and_stays_inside_the_picture(self):
+        # a tall, narrow zone in the corner: the window grows sideways, then is pushed inside
+        l, t, r, b = watch_window([box(0.0, 0.1, 0.1, 0.6)], aspect=1.0, margin=0.0)
+        self.assertAlmostEqual((r - l), (b - t))
+        self.assertGreaterEqual(l, 0.0)
+        self.assertLessEqual(r, 1.0)
+        self.assertGreaterEqual(t, 0.0)
+        self.assertLessEqual(b, 1.0)
+
+    def test_other_aspects(self):
+        # network input wider than the picture: window 4/3 as wide as it is high
+        l, t, r, b = watch_window([box(0.4, 0.4, 0.5, 0.5)], aspect=4 / 3.0, margin=0.05)
+        self.assertAlmostEqual((r - l) / (b - t), 4 / 3.0)
+
+    def test_zones_that_need_the_whole_picture_give_no_window(self):
+        self.assertIsNone(watch_window([box(0.0, 0.0, 0.5, 1.0, "l"), box(0.5, 0.0, 1.0, 1.0, "r")]))
+        self.assertIsNone(watch_window([box(0.1, 0.1, 0.9, 0.9)]))
+        self.assertIsNone(watch_window([box(0.0, 0.0, 0.2, 0.2, "a"), box(0.8, 0.8, 1.0, 1.0, "b")]))
+
+    def test_no_zones_no_window(self):
+        self.assertIsNone(watch_window([]))
 
 
 class SetZonesTest(unittest.TestCase):

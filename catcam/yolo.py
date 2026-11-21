@@ -96,6 +96,24 @@ def to_frame(box, fw, fh, scale, dx, dy):
     return tuple(min(1.0, max(0.0, v)) for v in out)
 
 
+def pixel_window(window, fw, fh, minimum=16):
+    """Window (l, t, r, b normalized) -> ((x0, y0, x1, y1) in pixels of a (fw, fh) frame,
+    the window as those pixels really cut it), or None if it is empty or tiny."""
+    x0, x1 = int(round(window[0] * fw)), int(round(window[2] * fw))
+    y0, y1 = int(round(window[1] * fh)), int(round(window[3] * fh))
+    x0, y0, x1, y1 = max(0, x0), max(0, y0), min(fw, x1), min(fh, y1)
+    if x1 - x0 < minimum or y1 - y0 < minimum:
+        return None
+    return (x0, y0, x1, y1), (x0 / float(fw), y0 / float(fh), x1 / float(fw), y1 / float(fh))
+
+
+def from_window(box, window):
+    """Box normalized to a window of the picture -> normalized to the whole picture."""
+    l, t, r, b = window
+    w, h = r - l, b - t
+    return (l + box[0] * w, t + box[1] * h, l + box[2] * w, t + box[3] * h)
+
+
 class YoloTrt(object):
     """Runs a YOLOv8 TensorRT engine on BGR frames (OpenCV) and returns normalized boxes."""
 
@@ -129,12 +147,27 @@ class YoloTrt(object):
         self.bindings = [int(self.mem_in.ptr), int(self.mem_out.ptr)]
         self.names = COCO
 
-    def detect(self, frame):
-        """frame: BGR uint8 (h, w, 3) -> [(class name, score, (l, t, r, b) normalized to the frame)]."""
+    def detect(self, frame, window=None):
+        """frame: BGR uint8 (h, w, 3) -> [(class name, score, (l, t, r, b) normalized to the frame)].
+
+        window = (l, t, r, b) normalized: look only at that part of the frame (the network then
+        sees it bigger, so smaller or more distant things are found). Boxes still come back
+        normalized to the whole frame.
+        """
         cv2 = self.cv2
+        cut = pixel_window(window, frame.shape[1], frame.shape[0]) if window else None
+        if cut is not None:
+            (x0, y0, x1, y1), window = cut
+            frame = frame[y0:y1, x0:x1]
+        else:
+            window = None
         fh, fw = frame.shape[:2]
         scale, nw, nh, dx, dy = letterbox_params(fw, fh, self.w, self.h)
-        img = frame if (nw, nh) == (fw, fh) else cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        if (nw, nh) == (fw, fh):
+            img = frame
+        else:  # INTER_AREA averages when shrinking; plain bilinear would skip pixels
+            img = cv2.resize(frame, (nw, nh),
+                             interpolation=cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR)
         if (nw, nh) != (self.w, self.h):  # letterbox: keep the aspect ratio, pad with grey
             canvas = np.full((self.h, self.w, 3), 114, np.uint8)
             canvas[dy:dy + nh, dx:dx + nw] = img
@@ -148,5 +181,6 @@ class YoloTrt(object):
         # numpy walk over it; cat only: reading a single row straight from it is cheapest
         out = np.array(self.view_out) if self.class_ids is None else self.view_out
         for cid, score, box in decode(out, self.conf, self.iou, self.class_ids):
-            results.append((self.names[cid], score, to_frame(box, fw, fh, scale, dx, dy)))
+            box = to_frame(box, fw, fh, scale, dx, dy)
+            results.append((self.names[cid], score, from_window(box, window) if window else box))
         return results

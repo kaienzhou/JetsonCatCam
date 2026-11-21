@@ -83,5 +83,78 @@ class LetterboxTest(unittest.TestCase):
         self.assertEqual(yolo.to_frame((-10, -10, 600, 500), 640, 480, 0.8, 0, 0), (0.0, 0.0, 1.0, 1.0))
 
 
+@unittest.skipIf(np is None, "numpy not installed")
+class WindowTest(unittest.TestCase):
+    def test_pixel_window_cuts_whole_pixels_and_reports_what_it_cut(self):
+        (x0, y0, x1, y1), real = yolo.pixel_window((0.25, 0.25, 0.75, 0.75), 640, 480)
+        self.assertEqual((x0, y0, x1, y1), (160, 120, 480, 360))
+        self.assertEqual(real, (0.25, 0.25, 0.75, 0.75))
+        _, real = yolo.pixel_window((0.1234, 0.1, 0.5, 0.5), 640, 480)  # 78.98 px -> 79 px
+        self.assertAlmostEqual(real[0], 79 / 640.0)
+
+    def test_pixel_window_is_clipped_and_tiny_ones_are_refused(self):
+        (x0, y0, x1, y1), _ = yolo.pixel_window((-0.2, 0.5, 1.3, 1.2), 640, 480)
+        self.assertEqual((x0, y0, x1, y1), (0, 240, 640, 480))
+        self.assertIsNone(yolo.pixel_window((0.5, 0.5, 0.51, 0.9), 640, 480))
+
+    def test_boxes_in_a_window_map_back_to_the_whole_picture(self):
+        got = yolo.from_window((0.5, 0.5, 1.0, 1.0), (0.25, 0.25, 0.75, 0.75))
+        for g, w in zip(got, (0.5, 0.5, 0.75, 0.75)):
+            self.assertAlmostEqual(g, w)
+
+
+class FakeContext(object):
+    """Stands in for the TensorRT execution context: 'finds' one cat in the middle of the input."""
+
+    def __init__(self, det):
+        self.det = det
+
+    def execute_v2(self, bindings):
+        self.det.view_out[:] = 0
+        self.det.view_out[0:4, 0] = (256, 192, 100, 80)   # cx, cy, w, h in input pixels
+        self.det.view_out[4 + yolo.CAT, 0] = 0.9
+        return True
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class DetectWindowTest(unittest.TestCase):
+    def make(self):
+        try:
+            import cv2
+        except ImportError:
+            self.skipTest("OpenCV not installed")
+        det = yolo.YoloTrt.__new__(yolo.YoloTrt)
+        det.cv2, det.conf, det.iou, det.class_ids, det.names = cv2, 0.3, 0.5, [yolo.CAT], yolo.COCO
+        det.h, det.w = 384, 512
+        det.view_in = np.zeros((3, 384, 512), np.float32)
+        det.view_out = np.zeros((84, 8), np.float32)
+        det.bindings = []
+        det.ctx = FakeContext(det)
+        return det
+
+    def test_without_a_window_the_whole_frame_is_used(self):
+        det = self.make()
+        (name, score, box), = det.detect(np.zeros((960, 1280, 3), np.uint8))
+        self.assertEqual(name, "cat")
+        for g, w in zip(box, (206 / 512.0, 152 / 384.0, 306 / 512.0, 232 / 384.0)):
+            self.assertAlmostEqual(g, w, places=4)
+
+    def test_a_window_is_what_the_network_sees_and_boxes_come_back_in_frame_coordinates(self):
+        det = self.make()
+        frame = np.zeros((960, 1280, 3), np.uint8)
+        frame[240:720, 640:1280] = 200                     # the window (0.5, 0.25, 1.0, 0.75)
+        (name, score, box), = det.detect(frame, (0.5, 0.25, 1.0, 0.75))
+        self.assertAlmostEqual(float(det.view_in.mean()), 200 / 255.0, places=2)  # nothing else in the input
+        want = (0.5 + 206 / 512.0 * 0.5, 0.25 + 152 / 384.0 * 0.5,
+                0.5 + 306 / 512.0 * 0.5, 0.25 + 232 / 384.0 * 0.5)
+        for g, w in zip(box, want):
+            self.assertAlmostEqual(g, w, places=4)
+
+    def test_a_window_that_is_too_small_falls_back_to_the_whole_frame(self):
+        det = self.make()
+        (name, score, box), = det.detect(np.zeros((960, 1280, 3), np.uint8), (0.5, 0.5, 0.505, 0.505))
+        self.assertAlmostEqual(box[0], 206 / 512.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()

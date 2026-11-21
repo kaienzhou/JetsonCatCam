@@ -1,0 +1,5 @@
+# Scripts run on the Jetson (Linux): keep LF line endings even when checked out on Windows,
+# where core.autocrlf would otherwise turn them into CRLF and break "#!/usr/bin/env bash".
+*.sh text eol=lf
+*.in text eol=lf
+*.py text eol=lf

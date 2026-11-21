@@ -357,10 +357,12 @@
       this.stage.style.setProperty("--ratio", this.ratio * 100 + "%");
       this.toolbar = h("div", {class: "row"});
       this.hint = h("p", {class: "muted small"});
+      this.watchHint = h("p", {class: "muted small"});
       this.list = h("div");
       this.msg = h("p", {class: "msg"});
       this.saveBtn = h("button", {class: "btn primary", text: "保存区域", onclick: () => this.save()});
-      view.appendChild(h("div", {class: "card"}, this.toolbar, h("div", {style: "height:10px"}), this.stage, this.hint));
+      view.appendChild(h("div", {class: "card"}, this.toolbar, h("div", {style: "height:10px"}), this.stage, this.hint,
+        this.watchHint));
       view.appendChild(h("div", {class: "card"}, h("h2", {text: "区域"}), this.list, this.msg,
         h("div", {class: "row", style: "margin-top:8px"}, this.saveBtn)));
       this.svg.addEventListener("pointerdown", (ev) => this.onDown(ev));
@@ -410,6 +412,10 @@
           const res = await fetch("/api/frame.jpg?raw=1&t=" + Date.now(), {credentials: "same-origin", cache: "no-store"});
           if (res.status === 401) { location.href = "/login"; return; }
           if (!res.ok) throw new Error("no picture");
+          const watch = (res.headers.get("X-Watch") || "").split(",").map(Number);
+          this.watch = watch.length === 4 && watch.every(isFinite) ? watch : null;  // what the detector looks at
+          this.watchHint.textContent = this.watch
+            ? "白色虚线框是检测范围：框里的猫才会被认出来，而且是放大着看的，所以区域圈得越集中，认得越远。" : "";
           const url = URL.createObjectURL(await res.blob());
           if (!this.alive) { URL.revokeObjectURL(url); return; }
           await new Promise((resolve, reject) => {
@@ -422,6 +428,7 @@
           this.lastUrl = url;
           this.bg.src = url;
           this.wait.style.display = "none";
+          this.drawSvg();
         } catch (e) {
           if (!this.bg.getAttribute("src")) {
             this.wait.textContent = "还没有摄像头画面，稍等一下……";
@@ -441,6 +448,15 @@
       const W = 1000, H = 1000 * this.ratio;
       const k = W / (this.svg.getBoundingClientRect().width || W);  // CSS pixels -> viewBox units
       const pt = function (p) { return p[0] * W + "," + p[1] * H; };
+      if (this.watch && !this.drawing) {  // the part of the picture the detector looks at (and sees bigger)
+        const w = this.watch;
+        this.svg.appendChild(svg("rect", {x: w[0] * W, y: w[1] * H, width: (w[2] - w[0]) * W, height: (w[3] - w[1]) * H,
+          fill: "none", stroke: "#ffffff", "stroke-width": 2, "stroke-dasharray": "8 6",
+          "vector-effect": "non-scaling-stroke", "pointer-events": "none"}));
+        this.svg.appendChild(svg("text", {x: w[0] * W + 8 * k, y: w[1] * H + 18 * k, "font-size": 13 * k, fill: "#ffffff",
+          stroke: "rgba(0,0,0,.7)", "stroke-width": 3 * k, "paint-order": "stroke", "pointer-events": "none",
+          text: "检测范围"}));
+      }
       this.zones.forEach((z, i) => {
         const color = colorFor(i);
         this.svg.appendChild(svg("polygon", {points: z.points.map(pt).join(" "), fill: color,
@@ -689,6 +705,47 @@
       this.load(card);
     },
     stop: function () { this.alive = false; },
+    debugCard: function (on, samples) {
+      const state = h("span", {class: "muted"});
+      const button = h("button", {class: "btn"});
+      const show = function () {
+        state.textContent = on ? "已打开" : "已关闭";
+        button.textContent = on ? "关闭" : "打开";
+        button.className = "btn" + (on ? "" : " primary");
+      };
+      show();
+      button.onclick = async function () {
+        button.disabled = true;
+        try {
+          const res = await postJson("/api/debug", {on: !on});
+          on = res.debug;
+          show();
+        } catch (e) { toast(e.message, true); }
+        button.disabled = false;
+      };
+      const card = h("div", {class: "card"}, h("h2", {text: "检测诊断"}),
+        h("div", {class: "row between"}, h("span", {text: "在直播画面上显示模型看到了什么"}), state, button),
+        h("p", {class: "muted small", text: "黄框：模型认出的猫（带置信度，高于 min_conf 才算数）。灰框带问号：模型有点怀疑是猫、但没到阈值。白色细框：检测范围（只看你画的区域并放大）。猫离得远却没被认出来时，先打开这个看看。"}));
+      if (samples !== null && samples !== undefined) {
+        const count = h("span", {class: "muted"});
+        const keep = h("button", {class: "btn", text: "存一张样本"});
+        const showCount = function () { count.textContent = "已存 " + samples + " 张"; };
+        showCount();
+        keep.onclick = async function () {
+          keep.disabled = true;
+          try {
+            const res = await postJson("/api/sample", {});
+            samples = res.count;
+            showCount();
+            toast("已保存");
+          } catch (e) { toast(e.message, true); }
+          keep.disabled = false;
+        };
+        card.appendChild(h("div", {class: "row between"}, h("span", {text: "猫在画面里却没被认出来时，点一下"}), count, keep));
+        card.appendChild(h("p", {class: "muted small", text: "会把当时的原始画面和模型的判断存在相机的 data/samples/ 里，用来分析为什么没认出来，也能用来训练只认你家猫的模型。只存在这台相机上，不会发到别处。"}));
+      }
+      return card;
+    },
     load: async function (card) {
       let info;
       try {
@@ -707,6 +764,7 @@
        kv("数据库", mb(info.storage.db_bytes)), kv("当前地址", location.origin)].forEach(function (row) {
         card.appendChild(row);
       });
+      view.appendChild(this.debugCard(info.debug, info.samples));
       view.appendChild(h("div", {class: "card"}, h("h2", {text: "数据"}),
         h("div", {class: "row"}, h("a", {class: "btn", href: "/api/export.csv?days=3650",
           download: "catcam-events.csv", text: "导出全部记录（CSV）"}))));

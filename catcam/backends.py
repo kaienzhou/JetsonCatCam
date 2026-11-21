@@ -10,6 +10,8 @@ import os
 import threading
 import time
 
+from .zones import watch_window
+
 
 def _cv2():
     try:
@@ -56,6 +58,13 @@ class FakeBackend(object):
         self.t0 = time.time()
         self.cv2 = _cv2()
         self._room = None
+        # what the real backend reports, so that the debug overlay and the editor have something to show
+        self.last_detections = []
+        self.weak = [("cat", 0.18, (0.05, 0.14, 0.15, 0.26))]  # a cushion the "network" is unsure about
+        self.window = None
+
+    def set_zones(self, zones):
+        self.window = watch_window(zones)
 
     def _scene(self, cx, cy):
         import numpy as np
@@ -106,6 +115,7 @@ class FakeBackend(object):
         cx, cy = self._pos()
         box = (cx - 0.06, cy - 0.06, cx + 0.06, cy + 0.06)
         frame = self._scene(cx, cy) if self.cv2 else None
+        self.last_detections = [("cat", 0.8, box)]
         return frame, (cx, cy), box
 
 
@@ -123,18 +133,25 @@ class CsiCapture(object):
 
     # nvvidconv flip-method for clockwise rotation in degrees
     FLIP_METHOD = {0: 0, 90: 3, 180: 2, 270: 1}
+    # nvvidconv interpolation-method: its default is 0 (nearest neighbour), which just drops
+    # pixels when the 1640x1232 sensor picture is shrunk and ruins small details.
+    # 1 bilinear, 2 5-tap, 3 10-tap, 4 smart, 5 nicest
+    INTERPOLATION = 5
 
     def __init__(self, cv2, sensor_id=0, sensor_mode=3, sensor_size=(1640, 1232),
-                 size=(640, 480), rate=30, rotate=0):
+                 size=(640, 480), rate=30, rotate=0, interpolation=INTERPOLATION):
         self.cv2 = cv2
+        if interpolation not in range(6):
+            raise ValueError("interpolation must be 0..5")
         out_w, out_h = size if rotate in (0, 180) else (size[1], size[0])
         self.pipeline = (
             "nvarguscamerasrc sensor-id=%d sensor-mode=%d ! "
             "video/x-raw(memory:NVMM),width=%d,height=%d,framerate=%d/1,format=NV12 ! "
-            "nvvidconv flip-method=%d ! video/x-raw,width=%d,height=%d,format=BGRx ! "
+            "nvvidconv flip-method=%d interpolation-method=%d ! "
+            "video/x-raw,width=%d,height=%d,format=BGRx ! "
             "videoconvert ! video/x-raw,format=BGR ! appsink drop=true max-buffers=1 sync=false"
             % (sensor_id, sensor_mode, sensor_size[0], sensor_size[1], rate,
-               self.FLIP_METHOD[rotate], out_w, out_h))
+               self.FLIP_METHOD[rotate], interpolation, out_w, out_h))
         self.cap = cv2.VideoCapture(self.pipeline, cv2.CAP_GSTREAMER)
         if not self.cap.isOpened():
             raise RuntimeError("cannot open the CSI camera (pipeline: %s)" % self.pipeline)
@@ -186,14 +203,22 @@ class JetsonBackend(object):
     detector={"type": "yolo", "engine": "models/yolov8n_384x512.fp16.engine"}: YOLOv8
     through TensorRT (see yolo.py), much better with small / distant cats. Optional keys:
     min_conf (0.4), iou (0.5), all_classes (true: also report every other COCO class,
-    for the debug overlay; false: cats only, a little faster).
+    for the debug overlay; false: cats only, a little faster), weak_conf (cats between
+    this and min_conf are kept in `weak` for the debug overlay; default: not reported),
+    zoom (true: once the zones are known through set_zones(), only that part of the
+    picture is looked at, so it is seen bigger), zoom_margin (0.08), zoom_min (0.3), and
+    max_fps (detect at most this often, 0 = on every picture): a big network needs 100 ms or
+    more per picture, so detection runs a few times a second while the pictures for the
+    web page keep coming at the camera's rate (read() then returns the last result again,
+    with `fresh` False).
 
     source "csi://N" (Raspberry Pi camera) is captured through OpenCV/GStreamer
-    (see CsiCapture): width/height are the size of the frames used for detection and
-    for the web page, sensor_mode/sensor_width/sensor_height pick the sensor mode
-    (default mode 3 = 1640x1232 at 30 fps for the IMX219). If no frame arrives for
-    `watchdog` seconds the process exits so a supervisor (systemd) can restart it
-    together with the camera daemon.
+    (see CsiCapture): width/height are the size of the frames used for detection
+    (the web page gets them shrunk to display_width), sensor_mode/sensor_width/
+    sensor_height pick the sensor mode (default mode 3 = 1640x1232 at 30 fps for the
+    IMX219) and interpolation how the picture is shrunk (see CsiCapture). If no frame
+    arrives for `watchdog` seconds the process exits so a supervisor (systemd) can
+    restart it together with the camera daemon.
 
     Any other source (USB camera "/dev/video0", a video file, ...) goes through
     jetson-utils videoSource. In jetson-inference (L4T R32.7.1) its Capture() raises
@@ -202,8 +227,10 @@ class JetsonBackend(object):
     There the frame for the web page is shrunk on the GPU to `display_width`.
 
     After every read(): `last_detections` lists everything the network found as
-    (class name, confidence, (left, top, right, bottom) normalized), and `timing`
-    holds moving averages in milliseconds for capture / detect / convert.
+    (class name, confidence, (left, top, right, bottom) normalized) at or above
+    min_conf, `weak` the cats it found below min_conf (only with weak_conf), `window`
+    the part of the picture that was looked at (None: all of it), and `timing` holds
+    moving averages in milliseconds for capture / detect / convert.
     """
 
     ROTATE_FLAG = {0: "none", 90: "clockwise", 180: "rotate-180", 270: "counterclockwise"}
@@ -211,6 +238,7 @@ class JetsonBackend(object):
     def __init__(self, source="/dev/video0", network="ssd-mobilenet-v2",
                  min_conf=0.4, width=640, height=480, rate=30, rotate=0,
                  sensor_mode=3, sensor_width=1640, sensor_height=1232,
+                 interpolation=CsiCapture.INTERPOLATION,
                  display_width=640, capture_timeout=500, reopen_after=10, watchdog=20,
                  detector=None):
         if rotate not in self.ROTATE_FLAG:
@@ -221,16 +249,26 @@ class JetsonBackend(object):
             raise ValueError("detector type must be 'ssd' or 'yolo'")
         inference, utils = _jetson_modules(need_inference=(kind == "ssd"))
         self.utils = utils
-        self.net = self.yolo = None
+        self.net = self.yolo = self.engine = None
+        self.min_conf = det.get("min_conf", min_conf)
+        self.zoom = bool(det.get("zoom", True))
+        self.zoom_margin = det.get("zoom_margin", 0.08)
+        self.zoom_min = det.get("zoom_min", 0.3)
+        max_fps = float(det.get("max_fps", 0) or 0)
+        self.detect_interval = 1.0 / max_fps if max_fps > 0 else 0.0
+        self.fresh = True            # did the last read() run the detector?
+        self._detected_at = 0.0
+        self._last_result = (None, None)
         if kind == "ssd":
-            self.net = inference.detectNet(det.get("network", network),
-                                           threshold=det.get("min_conf", min_conf))
+            self.net = inference.detectNet(det.get("network", network), threshold=self.min_conf)
         else:
             if _cv2() is None:
                 raise RuntimeError("OpenCV (cv2) is needed for the YOLO detector")
             from .yolo import YoloTrt, CAT
-            self.yolo = YoloTrt(det["engine"], utils, conf=det.get("min_conf", min_conf),
-                                iou=det.get("iou", 0.5),
+            weak = det.get("weak_conf")
+            conf = self.min_conf if weak is None else min(self.min_conf, weak)
+            self.engine = det["engine"]
+            self.yolo = YoloTrt(det["engine"], utils, conf=conf, iou=det.get("iou", 0.5),
                                 class_ids=None if det.get("all_classes") else (CAT,))
         self.source = source
         self.argv = ["--input-width=%d" % width, "--input-height=%d" % height,
@@ -246,6 +284,10 @@ class JetsonBackend(object):
         self.failures = 0
         self.timing = {}
         self.last_detections = []
+        self.weak = []
+        self.window = None
+        self._zones = []
+        self._window_shape = None
         self._small = None
         self._last_warn = 0.0
         self._last_frame = time.time()
@@ -256,9 +298,39 @@ class JetsonBackend(object):
             self.csi = CsiCapture(self.cv2, sensor_id=int(source[len("csi://"):] or 0),
                                   sensor_mode=sensor_mode,
                                   sensor_size=(sensor_width, sensor_height),
-                                  size=(width, height), rate=rate, rotate=rotate)
+                                  size=(width, height), rate=rate, rotate=rotate,
+                                  interpolation=interpolation)
         else:
             self._open()
+
+    def describe(self):
+        """The settings that matter when looking at a saved picture later."""
+        info = {"type": "yolo" if self.yolo is not None else "ssd", "min_conf": self.min_conf,
+                "zoom": self.zoom, "source": self.source}
+        if self.yolo is not None:
+            info.update(engine=self.engine, input=[self.yolo.w, self.yolo.h])
+        return info
+
+    def set_zones(self, zones):
+        """Tell the detector where the zones are (also again after they were edited).
+
+        With the YOLO detector and zoom on, it then only looks at the part of the picture
+        the zones are in, which it sees bigger: that is how smaller or more distant cats
+        are found there. Nothing outside that window is detected.
+        """
+        self._zones = list(zones)
+        self._window_shape = None  # worked out again for the next frame
+
+    def _window_for(self, frame):
+        shape = frame.shape[:2]
+        if shape != self._window_shape:
+            self._window_shape = shape
+            self.window = None
+            if self.zoom and self._zones:
+                fh, fw = shape
+                aspect = (self.yolo.w / float(self.yolo.h)) / (fw / float(fh))
+                self.window = watch_window(self._zones, aspect, self.zoom_margin, self.zoom_min)
+        return self.window
 
     def close(self):
         if self.csi is not None:
@@ -353,27 +425,36 @@ class JetsonBackend(object):
         img, frame = grabbed
 
         t0 = time.time()
+        if t0 - self._detected_at < self.detect_interval:
+            self.fresh = False  # not due yet: the picture again, with the result of the last detection
+            return (frame,) + self._last_result
         try:
             found = self._detect(img, frame)
         except Exception as e:
             self._warn("detect error: %s" % e)
             return None
-        self._tick("detect", t0)
-        self.last_detections = found
+        if self._detected_at:  # the very first detection includes the network's warm-up (seconds)
+            self._tick("detect", t0)
+        self._detected_at = t0
+        self.fresh = True
+        self.last_detections = [d for d in found if d[1] >= self.min_conf]
+        self.weak = [d for d in found if d[1] < self.min_conf and d[0] == "cat"]
 
         best = None
-        for name, conf, box in found:
+        for name, conf, box in self.last_detections:
             if name == "cat" and (best is None or conf > best[0]):
                 best = (conf, box)
         if best is None:
-            return frame, None, None
-        box = best[1]
-        return frame, ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), box
+            self._last_result = (None, None)
+        else:
+            box = best[1]
+            self._last_result = (((box[0] + box[2]) / 2, (box[1] + box[3]) / 2), box)
+        return (frame,) + self._last_result
 
     def _detect(self, img, frame):
         """-> [(class name, confidence, (left, top, right, bottom) normalized)]"""
         if self.yolo is not None:
-            return self.yolo.detect(frame)
+            return self.yolo.detect(frame, self._window_for(frame))
         w, h = img.width, img.height
         return [(self.net.GetClassDesc(d.ClassID), d.Confidence,
                  (d.Left / w, d.Top / h, d.Right / w, d.Bottom / h))

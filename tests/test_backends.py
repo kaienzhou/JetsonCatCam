@@ -111,6 +111,22 @@ def install_fake_cv2(frames=True, interval=0.01):
     return cv2
 
 
+class FakeBackendTest(unittest.TestCase):
+    def test_it_reports_what_a_real_detector_would_so_the_ui_can_be_tried_out(self):
+        from catcam.backends import FakeBackend
+        from catcam.zones import Zone
+        b = FakeBackend()
+        self.assertIsNone(b.window)
+        b.set_zones([Zone("bowl", [(0.6, 0.6), (0.9, 0.6), (0.9, 0.9), (0.6, 0.9)])])
+        self.assertIsNotNone(b.window)                   # a compact zone: the detector looks at part of the picture
+        b.set_zones([Zone("all", [(0, 0), (1, 0), (1, 1), (0, 1)])])
+        self.assertIsNone(b.window)
+        frame, point, box = b.read()
+        self.assertEqual([(n, c) for n, c, _ in b.last_detections], [("cat", 0.8)])
+        self.assertEqual(b.last_detections[0][2], box)
+        self.assertTrue(b.weak)
+
+
 class JetsonBackendTest(unittest.TestCase):
     def setUp(self):
         self._orig_cv2 = sys.modules.get("cv2")
@@ -150,6 +166,8 @@ class JetsonBackendTest(unittest.TestCase):
         b.read()
         self.assertEqual(b.last_detections, [("person", 0.70, (0.0, 0.0, 0.5, 0.5)),
                                              ("cat", 0.45, (0.5, 0.5, 1.0, 1.0))])
+        self.assertEqual(sorted(b.timing), ["capture", "convert"])  # the first detection is warm-up: not timed
+        b.read()
         self.assertEqual(sorted(b.timing), ["capture", "convert", "detect"])
 
     def test_no_cat_returns_empty_tuple_not_none(self):
@@ -228,15 +246,32 @@ class JetsonBackendTest(unittest.TestCase):
         finally:
             b.close()
 
+    def test_csi_picture_is_shrunk_with_a_proper_filter_not_nearest_neighbour(self):
+        # nvvidconv's own default (0, nearest) drops pixels and hurts small details
+        b, cv2 = self.make_csi([])
+        b.close()
+        self.assertIn("nvvidconv flip-method=0 interpolation-method=5 ! ", cv2.captures[0].pipeline)
+        b, cv2 = self.make_csi([], interpolation=3)
+        b.close()
+        self.assertIn("interpolation-method=3 ! ", cv2.captures[0].pipeline)
+        with self.assertRaises(ValueError):
+            self.make_csi([], interpolation=6)
+
+    def test_csi_frame_size_is_independent_of_the_sensor_size(self):
+        b, cv2 = self.make_csi([], width=1024, height=768)
+        b.close()
+        self.assertIn("width=1640,height=1232,framerate=30/1", cv2.captures[0].pipeline)
+        self.assertIn("width=1024,height=768,format=BGRx", cv2.captures[0].pipeline)
+
     def test_csi_rotation_sets_flip_method_and_swaps_output_size(self):
         seen = {}
         for rotate in (90, 180, 270):
             b, cv2 = self.make_csi([], rotate=rotate)
             seen[rotate] = cv2.captures[0].pipeline
             b.close()
-        self.assertIn("flip-method=3 ! video/x-raw,width=480,height=640", seen[90])
-        self.assertIn("flip-method=2 ! video/x-raw,width=640,height=480", seen[180])
-        self.assertIn("flip-method=1 ! video/x-raw,width=480,height=640", seen[270])
+        self.assertIn("flip-method=3 interpolation-method=5 ! video/x-raw,width=480,height=640", seen[90])
+        self.assertIn("flip-method=2 interpolation-method=5 ! video/x-raw,width=640,height=480", seen[180])
+        self.assertIn("flip-method=1 interpolation-method=5 ! video/x-raw,width=480,height=640", seen[270])
 
     def test_csi_read_returns_frame_and_cat(self):
         b, cv2 = self.make_csi([Det(17, 0.8, 0, 0, 320, 240)])
@@ -245,6 +280,7 @@ class JetsonBackendTest(unittest.TestCase):
             self.assertIsInstance(frame, FakeFrame)
             self.assertEqual(box, (0.0, 0.0, 0.5, 0.5))
             self.assertEqual(point, (0.25, 0.25))
+            b.read()
             self.assertEqual(sorted(b.timing), ["capture", "convert", "detect"])
         finally:
             b.close()
@@ -280,10 +316,14 @@ class JetsonBackendTest(unittest.TestCase):
         fake.CAT = 15
 
         class YoloTrt(object):
+            w, h = 512, 384          # network input: 4:3, like the camera picture
+
             def __init__(self, engine, utils, conf, iou, class_ids):
                 created.update(engine=engine, conf=conf, iou=iou, class_ids=class_ids)
+                created["windows"] = []
 
-            def detect(self, frame):
+            def detect(self, frame, window=None):
+                created["windows"].append(window)
                 return found
         fake.YoloTrt = YoloTrt
         sys.modules["catcam.yolo"] = fake
@@ -295,10 +335,122 @@ class JetsonBackendTest(unittest.TestCase):
     def test_yolo_gets_engine_and_options(self):
         b, created, _ = self.make_yolo([])
         b.close()
-        self.assertEqual(created, {"engine": "m.engine", "conf": 0.4, "iou": 0.5, "class_ids": (15,)})
+        self.assertEqual({k: created[k] for k in ("engine", "conf", "iou", "class_ids")},
+                         {"engine": "m.engine", "conf": 0.4, "iou": 0.5, "class_ids": (15,)})
         b, created, _ = self.make_yolo([], detector={"min_conf": 0.3, "iou": 0.6, "all_classes": True})
         b.close()
-        self.assertEqual(created, {"engine": "m.engine", "conf": 0.3, "iou": 0.6, "class_ids": None})
+        self.assertEqual({k: created[k] for k in ("engine", "conf", "iou", "class_ids")},
+                         {"engine": "m.engine", "conf": 0.3, "iou": 0.6, "class_ids": None})
+
+    def test_weak_cats_are_reported_separately_and_never_counted(self):
+        found = [("cat", 0.62, (0.5, 0.5, 0.7, 0.7)), ("cat", 0.25, (0.1, 0.1, 0.2, 0.2)),
+                 ("dog", 0.2, (0.3, 0.3, 0.4, 0.4))]
+        b, created, _ = self.make_yolo(found, detector={"min_conf": 0.4, "weak_conf": 0.1})
+        try:
+            self.assertEqual(created["conf"], 0.1)  # the network reports down to weak_conf
+            frame, point, box = b.read()
+        finally:
+            b.close()
+        self.assertEqual([(n, c) for n, c, _ in b.last_detections], [("cat", 0.62)])
+        self.assertEqual([(n, c) for n, c, _ in b.weak], [("cat", 0.25)])  # not the weak dog
+        self.assertAlmostEqual(box[0], 0.5)  # the tracker only ever sees the confident cat
+
+    def test_a_weak_cat_alone_is_not_a_cat(self):
+        b, _, _ = self.make_yolo([("cat", 0.25, (0.1, 0.1, 0.2, 0.2))],
+                                 detector={"min_conf": 0.4, "weak_conf": 0.1})
+        try:
+            frame, point, box = b.read()
+        finally:
+            b.close()
+        self.assertEqual((point, box), (None, None))
+
+    def test_without_weak_conf_the_network_threshold_is_min_conf(self):
+        b, created, _ = self.make_yolo([], detector={"min_conf": 0.35})
+        b.close()
+        self.assertEqual(created["conf"], 0.35)
+        self.assertEqual(b.weak, [])
+
+    def test_detection_is_limited_to_max_fps_but_every_picture_comes_through(self):
+        found = [("cat", 0.8, (0.4, 0.4, 0.6, 0.6))]
+        b, created, _ = self.make_yolo(found, detector={"max_fps": 5})
+        try:
+            first = b.read()
+            self.assertTrue(b.fresh)
+            second = b.read()                       # ~10 ms later: no detection due yet (5 per second)
+            self.assertFalse(b.fresh)
+            self.assertEqual(len(created["windows"]), 1)
+            self.assertIsNot(first[0], second[0])   # a new picture ...
+            self.assertEqual(first[1:], second[1:])  # ... with the result of the last detection
+            time.sleep(0.25)
+            b.read()
+            self.assertTrue(b.fresh)
+            self.assertEqual(len(created["windows"]), 2)
+        finally:
+            b.close()
+
+    def test_a_cat_that_left_is_forgotten_at_the_next_detection_not_before(self):
+        found = [("cat", 0.8, (0.4, 0.4, 0.6, 0.6))]
+        b, created, _ = self.make_yolo(found, detector={"max_fps": 5})
+        try:
+            self.assertIsNotNone(b.read()[1])
+            found[:] = []                           # the cat is gone ...
+            self.assertIsNotNone(b.read()[1])       # ... but nobody has looked yet
+            time.sleep(0.25)
+            self.assertIsNone(b.read()[1])
+        finally:
+            b.close()
+
+    def test_without_max_fps_every_picture_is_detected(self):
+        b, created, _ = self.make_yolo([])
+        try:
+            b.read()
+            b.read()
+            b.read()
+        finally:
+            b.close()
+        self.assertEqual(len(created["windows"]), 3)
+        self.assertTrue(b.fresh)
+
+    ZONE_TOP_LEFT = [types.SimpleNamespace(points=[(0.05, 0.05), (0.25, 0.05), (0.25, 0.25), (0.05, 0.25)])]
+    ZONE_EVERYWHERE = [types.SimpleNamespace(points=[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])]
+
+    def test_without_zones_the_whole_picture_is_looked_at(self):
+        b, created, _ = self.make_yolo([])
+        try:
+            b.read()
+        finally:
+            b.close()
+        self.assertEqual(created["windows"], [None])
+        self.assertIsNone(b.window)
+
+    def test_zones_make_the_detector_look_only_at_their_part_of_the_picture(self):
+        b, created, _ = self.make_yolo([])
+        try:
+            b.set_zones(self.ZONE_TOP_LEFT)
+            b.read()
+            window = created["windows"][-1]
+            self.assertIsNotNone(window)
+            self.assertEqual(window, b.window)
+            l, t, r, bottom = window
+            self.assertLess(r - l, 0.5)
+            self.assertAlmostEqual((r - l) / (bottom - t), 1.0)  # 4:3 picture, 4:3 network input
+            self.assertLessEqual(l, 0.05)
+            self.assertGreaterEqual(r, 0.25)
+            b.set_zones(self.ZONE_EVERYWHERE)  # edited: nothing to cut away any more
+            b.read()
+            self.assertIsNone(created["windows"][-1])
+            self.assertIsNone(b.window)
+        finally:
+            b.close()
+
+    def test_zoom_can_be_switched_off(self):
+        b, created, _ = self.make_yolo([], detector={"zoom": False})
+        try:
+            b.set_zones(self.ZONE_TOP_LEFT)
+            b.read()
+        finally:
+            b.close()
+        self.assertEqual(created["windows"], [None])
 
     def test_yolo_read_picks_the_best_cat(self):
         found = [("dog", 0.9, (0.0, 0.0, 0.2, 0.2)),

@@ -72,6 +72,16 @@ class RunLoopTest(RunLoopTestCase):
         self.assertEqual(state["visits"], {"all": 1})  # the visit in progress counts
         self.assertIn("all", state["totals"])
 
+    def test_fps_is_the_average_rate_even_when_pictures_arrive_in_bursts(self):
+        # a slow detection (50 ms) is followed by a picture that was already waiting (about 1 ms):
+        # 100 pictures in 2.5 s are 40 per second, not the 1000 that averaging 1 / dt would give
+        def slow_every_other(n):
+            time.sleep(0.05 if n % 2 else 0.001)
+        self.run_loop(CountingBackend([(None, None, None)], on_read=slow_every_other), 60)
+        fps = self.shared.get_state()["fps"]
+        self.assertGreater(fps, 25)
+        self.assertLess(fps, 55)
+
     def test_events_go_into_the_history_and_into_the_state(self):
         self.run_loop(CountingBackend([(None, INSIDE, BOX)]), 5)
         self.assertEqual([e["type"] for e in self.store.recent()], ["appear", "enter"])
@@ -109,6 +119,26 @@ class RunLoopTest(RunLoopTestCase):
         self.run_loop(CountingBackend([(None, INSIDE, BOX)]), 4)
         self.assertEqual(self.shared.get_state()["status"], "ok")
 
+    def test_a_picture_without_a_new_detection_does_not_count_as_another_sighting(self):
+        class Between(CountingBackend):
+            fresh = False
+        self.run_loop(Between([(None, INSIDE, BOX)]), 6)
+        self.assertEqual(self.store.recent(), [])  # enter_frames was 2: six repeats of one result must not enter
+        self.assertEqual(self.shared.get_state()["status"], "ok")  # the pictures still came through
+
+    def test_a_backend_is_told_the_zones_at_the_start_and_after_every_edit(self):
+        told = []
+
+        class ZoneAware(CountingBackend):
+            def set_zones(self, zones):
+                told.append([z.name for z in zones])
+
+        def save_new_zones(n):
+            if n == 3:
+                self.shared.request_zones([Zone("new", SQUARE)])
+        self.run_loop(ZoneAware([(None, INSIDE, BOX)], on_read=save_new_zones), 6)
+        self.assertEqual(told, [["all"], ["new"]])
+
 
 @unittest.skipUnless(cv2 is not None and np is not None, "needs OpenCV and numpy")
 class PictureTest(RunLoopTestCase):
@@ -131,6 +161,36 @@ class PictureTest(RunLoopTestCase):
         self.shared.raw_until = time.monotonic() + 30
         self.run_loop(self.frames(), 4)
         self.assertTrue(self.shared.raw.startswith(b"\xff\xd8"))
+        self.assertIsNone(self.shared.raw_watch)  # this backend looks at the whole picture
+
+    def test_the_editor_is_told_what_part_of_the_picture_the_detector_looks_at(self):
+        class Zoomed(CountingBackend):
+            window = (0.25, 0.25, 0.75, 0.75)
+        self.shared.raw_until = time.monotonic() + 30
+        self.run_loop(Zoomed([(np.zeros((48, 64, 3), np.uint8), INSIDE, BOX)]), 4)
+        self.assertEqual(self.shared.raw_watch, (0.25, 0.25, 0.75, 0.75))
+
+    def shown_size(self, **kw):
+        self.shared.last_view = time.monotonic()
+        backend = CountingBackend([(np.zeros((96, 128, 3), np.uint8), INSIDE, BOX)])
+        self.run_loop(backend, 3, **kw)
+        img = cv2.imdecode(np.frombuffer(self.shared.image, np.uint8), cv2.IMREAD_COLOR)
+        return img.shape[:2]
+
+    def test_frames_bigger_than_display_width_are_shrunk_for_the_page(self):
+        self.assertEqual(self.shown_size(display_width=64), (48, 64))
+
+    def test_smaller_frames_and_display_width_zero_are_left_alone(self):
+        self.assertEqual(self.shown_size(display_width=640), (96, 128))
+        self.assertEqual(self.shown_size(), (96, 128))
+
+    def test_the_overlay_shows_the_window_and_the_cats_the_detector_was_unsure_about(self):
+        frame = np.zeros((100, 200, 3), np.uint8)
+        zones = [Zone("all", SQUARE)]
+        app.draw(cv2, frame, zones, None, None, [], [("cat", 0.2, (0.1, 0.1, 0.3, 0.3))],
+                 (0.25, 0.25, 0.75, 0.75))
+        self.assertEqual(frame[40, 50].tolist(), [255, 255, 255])    # left edge of the window (white)
+        self.assertEqual(frame[20, 20].tolist(), [150, 150, 150])   # left edge of the weak cat's box
 
 
 class MakeStateTest(unittest.TestCase):
